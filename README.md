@@ -7,6 +7,10 @@ Human names for sessions — `/name` plus a `prompt/context` hook. Port of pi's
 
 - `/name <text>` — give the current session a friendly name
 - `/name` — show the current name (or that none is set)
+- `/name set` — interactive prompt via `host/ask`: the question "Name this
+  session" is sent with an empty options list, so the free-form notes box
+  is the input (`answers[qid].notes` wins; the first `answers` entry is the
+  fallback). Without an ask channel it replies with the direct-set hint.
 
 ## Hooks
 
@@ -23,12 +27,14 @@ keeps them keyed by `session.id` instead.
 ## Wire methods
 
 `plugin/manifest`, `command/run`, `prompt/context`, `plugin/shutdown`.
-Protocol 1.1. No tools, no capabilities, no host→sidecar requests.
+Protocol 1.1. No tools. Capability `host.ask` powers `/name set` — without
+it the command explains how to set the name directly.
 
 ## Install
 
 ```sh
 gray plugin install session-name
+gray plugin capabilities session-name --all   # grants host.ask for /name set
 ```
 
 ## Develop

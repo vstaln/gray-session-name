@@ -1,18 +1,28 @@
 //! gray-session-name — human names for sessions.
 //!
 //! Port of pi's `session-name` extension: `/name <text>` gives the current
-//! session a friendly name, `/name` shows it. Pi stored names in session
-//! metadata; gray sidecars keep a map at
+//! session a friendly name, `/name` shows it, and `/name set` asks
+//! interactively via `host/ask` (capability `host.ask`) — the question is
+//! sent with an EMPTY options list so the free-form notes box is the input;
+//! `answers[qid].notes` is the name (first `answers` entry as fallback).
+//! Pi stored names in session metadata; gray sidecars keep a map at
 //! `~/.gray/session-name/names.json` keyed by `session.id`.
 //!
 //! A `prompt/context` hook surfaces the name to the model once per session
 //! (the host dedups injected context, so it stays quiet after the first
 //! turn).
 
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 use serde_json::{Value, json};
+
+/// Internal cap on `host/ask` waits — under the host's 330s outer TTL.
+const ASK_TTL: Duration = Duration::from_secs(300);
+const NAME_QID: &str = "session-name";
 
 fn manifest() -> Value {
     json!({
@@ -22,6 +32,7 @@ fn manifest() -> Value {
         "tools": [],
         "commands": ["/name"],
         "hooks": ["prompt/context"],
+        "capabilities": ["host.ask"],
     })
 }
 
@@ -58,25 +69,76 @@ fn session_id(params: &Value) -> &str {
         .unwrap_or("")
 }
 
-/// `/name …` — `argv` excludes the command name.
-fn run_command(argv: &[&str], session: &str) -> String {
-    let name = argv.join(" ");
-    let name = name.trim();
-    if session.is_empty() {
-        return "no session id — nothing to name".into();
-    }
+fn set_name(session: &str, name: &str) -> String {
     let mut names = load_names();
-    if name.is_empty() {
-        return match names.get(session).and_then(Value::as_str) {
-            Some(n) => format!("Session: {n}"),
-            None => "No session name set".into(),
-        };
-    }
     names[session] = json!(name);
     match save_names(&names) {
         Ok(()) => format!("Session named: {name}"),
         Err(e) => format!("couldn't save name: {e}"),
     }
+}
+
+/// The free-form answer to a `host/ask` question with empty options:
+/// `notes` first, then the first `answers` entry as fallback.
+fn ask_text(result: &Value, qid: &str) -> Option<String> {
+    let e = result.get("answers")?.get(qid)?;
+    if let Some(n) = e.get("notes").and_then(Value::as_str) {
+        let n = n.trim();
+        if !n.is_empty() {
+            return Some(n.to_string());
+        }
+    }
+    e.get("answers")?
+        .as_array()?
+        .first()?
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// `/name set` — ask for the name via `host/ask` with no options so the
+/// notes box carries it. No ask channel → tell the user how to set it.
+fn name_interactive(session: &str, ask: &mut dyn FnMut(&[Value]) -> Option<Value>) -> String {
+    if session.is_empty() {
+        return "no session id — nothing to name".into();
+    }
+    let questions = [json!({
+        "id": NAME_QID,
+        "header": "Session name",
+        "question": "Name this session",
+        "options": [],
+    })];
+    let Some(result) = ask(&questions) else {
+        return "no answer channel — use /name <text> to set the name directly".into();
+    };
+    match ask_text(&result, NAME_QID) {
+        Some(name) => set_name(session, &name),
+        None => "no name given".into(),
+    }
+}
+
+/// `/name …` — `argv` excludes the command name.
+fn run_command(
+    argv: &[&str],
+    session: &str,
+    ask: &mut dyn FnMut(&[Value]) -> Option<Value>,
+) -> String {
+    if argv == ["set"] {
+        return name_interactive(session, ask);
+    }
+    let name = argv.join(" ");
+    let name = name.trim();
+    if session.is_empty() {
+        return "no session id — nothing to name".into();
+    }
+    if name.is_empty() {
+        return match load_names().get(session).and_then(Value::as_str) {
+            Some(n) => format!("Session: {n}"),
+            None => "No session name set".into(),
+        };
+    }
+    set_name(session, name)
 }
 
 /// `prompt/context` — tell the model the session's name once (host dedups).
@@ -92,8 +154,8 @@ fn prompt_context(params: &Value) -> Value {
 }
 
 /// One request → `Some(reply)`, or `None` for notifications. The bool asks
-/// the loop to exit after writing the reply.
-fn handle(req: &Value) -> (Option<Value>, bool) {
+/// the loop to exit after writing the reply. `ask` is the host/ask channel.
+fn handle(req: &Value, ask: &mut dyn FnMut(&[Value]) -> Option<Value>) -> (Option<Value>, bool) {
     let id = req.get("id").cloned();
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(Value::Null);
@@ -108,7 +170,7 @@ fn handle(req: &Value) -> (Option<Value>, bool) {
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(Value::as_str).collect())
                 .unwrap_or_default();
-            json!({ "text": run_command(&argv, session_id(&params)) })
+            json!({ "text": run_command(&argv, session_id(&params), ask) })
         }
         "prompt/context" => prompt_context(&params),
         "plugin/shutdown" => return (Some(json!({ "id": id, "result": {} })), true),
@@ -120,25 +182,85 @@ fn handle(req: &Value) -> (Option<Value>, bool) {
     (Some(json!({ "id": id, "result": result })), false)
 }
 
+type Pending = Arc<Mutex<HashMap<String, mpsc::Sender<Value>>>>;
+
+fn next_id(counter: &Mutex<u64>) -> String {
+    let mut n = counter.lock().expect("id counter");
+    *n += 1;
+    format!("q{n}")
+}
+
+/// `host/ask` round-trip: write the request, wait on the pending channel.
+/// None on timeout or a dead channel — callers degrade to text.
+fn ask_host(
+    out: &Mutex<std::io::Stdout>,
+    pending: &Pending,
+    counter: &Mutex<u64>,
+    questions: &[Value],
+) -> Option<Value> {
+    let id = next_id(counter);
+    let (tx, rx) = mpsc::channel();
+    pending.lock().expect("pending").insert(id.clone(), tx);
+    let req = json!({
+        "id": id,
+        "method": "host/ask",
+        "params": { "questions": questions, "blocking": true },
+    });
+    {
+        let mut o = out.lock().expect("stdout");
+        let _ = writeln!(o, "{req}");
+        let _ = o.flush();
+    }
+    let reply = rx.recv_timeout(ASK_TTL).ok();
+    pending.lock().expect("pending").remove(&id);
+    reply
+}
+
 fn main() -> std::io::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("manifest") {
         println!("{}", manifest());
         return Ok(());
     }
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        let Ok(req) = serde_json::from_str::<Value>(&line) else { continue };
-        let (reply, exit) = handle(&req);
+    let stdout = Arc::new(Mutex::new(std::io::stdout()));
+    let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+    let counter = Mutex::new(0u64);
+
+    // Reader thread: host answers (string ids, no method) go to `pending`;
+    // everything else — requests and notifications — goes to the work loop.
+    let (work_tx, work_rx) = mpsc::channel::<Value>();
+    let reader_pending = pending.clone();
+    let _reader = std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            let Ok(line) = line else { break };
+            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+            if let Some(id) = v.get("id").and_then(Value::as_str)
+                && v.get("method").is_none()
+                && let Some(tx) = reader_pending.lock().expect("pending").remove(id)
+            {
+                let _ = tx.send(v.get("result").cloned().unwrap_or(Value::Null));
+                continue;
+            }
+            if work_tx.send(v).is_err() {
+                break;
+            }
+        }
+    });
+
+    for req in work_rx {
+        let mut asker = |questions: &[Value]| ask_host(&stdout, &pending, &counter, questions);
+        let (reply, exit) = handle(&req, &mut asker);
         if let Some(reply) = reply {
-            writeln!(stdout, "{reply}")?;
-            stdout.flush()?;
+            let mut o = stdout.lock().expect("stdout");
+            writeln!(o, "{reply}")?;
+            o.flush()?;
         }
         if exit {
             break;
         }
     }
+    // The reader thread is a detached stdin pump; returning from main
+    // ends the process with it, so there is nothing to join.
     Ok(())
 }
 
@@ -146,8 +268,22 @@ fn main() -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    fn no_ask() -> impl FnMut(&[Value]) -> Option<Value> {
+        |_: &[Value]| None
+    }
+
     fn call(method: &str, params: Value) -> Value {
-        handle(&json!({ "id": 1, "method": method, "params": params })).0.unwrap()
+        call_with(method, params, &mut no_ask())
+    }
+
+    fn call_with(
+        method: &str,
+        params: Value,
+        ask: &mut dyn FnMut(&[Value]) -> Option<Value>,
+    ) -> Value {
+        handle(&json!({ "id": 1, "method": method, "params": params }), ask)
+            .0
+            .unwrap()
     }
 
     /// Serialized: GRAY_HOME is process-global and tests share the process.
@@ -172,6 +308,7 @@ mod tests {
         assert_eq!(m["name"], "session-name");
         assert_eq!(m["commands"], json!(["/name"]));
         assert_eq!(m["hooks"], json!(["prompt/context"]));
+        assert_eq!(m["capabilities"], json!(["host.ask"]));
     }
 
     #[test]
@@ -208,6 +345,76 @@ mod tests {
     }
 
     #[test]
+    fn name_set_uses_notes_box() {
+        with_home(|_| {
+            let sess = json!({"id": "s-77", "cwd": "/tmp/x"});
+            let mut ask = |qs: &[Value]| -> Option<Value> {
+                // Empty options → the free-form notes box is the input.
+                assert_eq!(qs[0]["question"], "Name this session");
+                assert_eq!(qs[0]["options"], json!([]));
+                Some(json!({"answers": {NAME_QID: {"answers": ["yes"], "notes": "  notes win  "}}}))
+            };
+            let r = call_with(
+                "command/run",
+                json!({"name": "/name", "argv": ["set"], "session": sess}),
+                &mut ask,
+            );
+            assert_eq!(r["result"]["text"], "Session named: notes win");
+            assert_eq!(load_names()["s-77"], "notes win");
+        });
+    }
+
+    #[test]
+    fn name_set_falls_back_to_answers_entry() {
+        with_home(|_| {
+            let sess = json!({"id": "s-78", "cwd": "/tmp/x"});
+            let mut ask = |_: &[Value]| -> Option<Value> {
+                Some(json!({"answers": {NAME_QID: {"answers": ["typed name"], "notes": ""}}}))
+            };
+            let r = call_with(
+                "command/run",
+                json!({"name": "/name", "argv": ["set"], "session": sess}),
+                &mut ask,
+            );
+            assert_eq!(r["result"]["text"], "Session named: typed name");
+        });
+    }
+
+    #[test]
+    fn name_set_without_channel_or_empty_answer() {
+        with_home(|_| {
+            let sess = json!({"id": "s-79", "cwd": "/tmp/x"});
+            let r = call(
+                "command/run",
+                json!({"name": "/name", "argv": ["set"], "session": sess}),
+            );
+            assert!(r["result"]["text"].as_str().unwrap().contains("no answer channel"));
+            let mut empty = |_: &[Value]| -> Option<Value> {
+                Some(json!({"answers": {NAME_QID: {"answers": [], "notes": ""}}}))
+            };
+            let r = call_with(
+                "command/run",
+                json!({"name": "/name", "argv": ["set"], "session": sess}),
+                &mut empty,
+            );
+            assert_eq!(r["result"]["text"], "no name given");
+            assert!(load_names().get("s-79").is_none());
+        });
+    }
+
+    #[test]
+    fn name_set_with_extra_args_sets_directly() {
+        with_home(|_| {
+            let sess = json!({"id": "s-80", "cwd": "/tmp/x"});
+            let r = call(
+                "command/run",
+                json!({"name": "/name", "argv": ["set", "sail"], "session": sess}),
+            );
+            assert_eq!(r["result"]["text"], "Session named: set sail");
+        });
+    }
+
+    #[test]
     fn empty_session_id_is_safe() {
         with_home(|_| {
             let r = call("command/run", json!({"name": "/name", "argv": ["x"], "session": {}}));
@@ -218,7 +425,8 @@ mod tests {
 
     #[test]
     fn shutdown_replies_then_exits() {
-        let (reply, exit) = handle(&json!({ "id": 2, "method": "plugin/shutdown" }));
+        let (reply, exit) =
+            handle(&json!({ "id": 2, "method": "plugin/shutdown" }), &mut no_ask());
         assert!(reply.is_some() && exit);
     }
 }
