@@ -1,0 +1,17 @@
+[package]
+name = "gray-session-name"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT"
+description = "Human names for sessions (/name + prompt/context). Port of pi's session-name extension."
+
+[[bin]]
+name = "gray-session-name"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+
+[profile.release]
+strip = true
