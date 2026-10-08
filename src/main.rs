@@ -1,13 +1,12 @@
 //! gray-session-name — human names for sessions.
 //!
-//! Port of pi's `session-name` extension: `/name <text>` gives the current
-//! session a friendly name, `/name` shows it, and `/name set` asks
-//! interactively via `host/ask` (capability `host.ask`) — the question is
-//! sent with an EMPTY options list so the free-form notes box is the input;
-//! `answers[qid].notes` is the name (first `answers` entry as fallback).
-//! Pi stored names in session metadata; gray sidecars keep a map at
-//! `~/.gray/session-name/names.json` keyed by `session.id`.
+//! `/name <text>` gives the current session a friendly name, `/name` shows
+//! it, and `/name set` asks interactively via `host/ask` (capability
+//! `host.ask`) — the question is sent with an EMPTY options list so the
+//! free-form notes box is the input; `answers[qid].notes` is the name
+//! (first `answers` entry as fallback).
 //!
+//! Names live at `~/.gray/session-name/names.json` keyed by `session.id`.
 //! A `prompt/context` hook surfaces the name to the model once per session
 //! (the host dedups injected context, so it stays quiet after the first
 //! turn).

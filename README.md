@@ -1,34 +1,41 @@
-# gray-session-name
+<p align="center">
+  <img src="assets/gray-logo.svg" alt="gray" width="96">
+</p>
+<h1 align="center">gray-session-name</h1>
+<p align="center">Assign human-friendly names to gray sessions.</p>
+<p align="center">
+  <a href="https://github.com/vstaln/gray-session-name/blob/main/LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <img alt="gray plugin" src="https://img.shields.io/badge/gray-plugin-7aa2f7.svg">
+  <img alt="rust" src="https://img.shields.io/badge/built%20with-rust-orange.svg">
+</p>
 
-Human names for sessions — `/name` plus a `prompt/context` hook. Port of pi's
-`session-name` extension.
+Give the current session a memorable name and surface it to the model when
+the session starts.
 
 ## Commands
 
-- `/name <text>` — give the current session a friendly name
-- `/name` — show the current name (or that none is set)
-- `/name set` — interactive prompt via `host/ask`: the question "Name this
-  session" is sent with an empty options list, so the free-form notes box
-  is the input (`answers[qid].notes` wins; the first `answers` entry is the
-  fallback). Without an ask channel it replies with the direct-set hint.
+- `/name <text>` — set the current session's friendly name
+- `/name` — show the current name, or report that none is set
+- `/name set` — interactive prompt through `host/ask`: the free-form notes
+  box supplies the name. Without an ask channel, the command explains how to
+  set the name directly.
 
 ## Hooks
 
-`prompt/context` returns `{text: "This session is named \"X\"."}` when the
-session has a name. The host dedups injected context, so it surfaces once and
-stays quiet after the first turn.
+`prompt/context` returns `{text: "This session is named "X"."}` when a
+name is set. The host deduplicates injected context, so it appears once and
+stays quiet on later turns.
 
 ## State
 
-`~/.gray/session-name/names.json` (honors `$GRAY_HOME`) — a
-`{session_id: name}` map. Pi stored names in session metadata; the sidecar
-keeps them keyed by `session.id` instead.
+`~/.gray/session-name/names.json` (honors `$GRAY_HOME`) stores a
+`{session_id: name}` map.
 
 ## Wire methods
 
 `plugin/manifest`, `command/run`, `prompt/context`, `plugin/shutdown`.
-Protocol 1.1. No tools. Capability `host.ask` powers `/name set` — without
-it the command explains how to set the name directly.
+Protocol 1.1. No tools. Capability `host.ask` powers `/name set`; without it
+the command explains how to set the name directly.
 
 ## Install
 
@@ -44,3 +51,7 @@ cargo test
 gray account check      # entry point + manifest handshake
 gray account publish    # check → build → release → publish to the gray registry
 ```
+
+---
+Part of the [gray](https://github.com/vstaln/gray) plugin ecosystem —
+the open-source AI agent harness. <https://gray.alignment.id>
