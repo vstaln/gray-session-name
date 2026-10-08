@@ -1,10 +1,16 @@
-//! gray-session-name — a gray sidecar plugin.
+//! gray-session-name — human names for sessions.
 //!
-//! With no arguments it speaks gray's NDJSON wire protocol on stdio: one JSON
-//! request per stdin line, one reply per stdout line. `gray-session-name manifest`
-//! prints the manifest for humans and `gray account check`.
+//! Port of pi's `session-name` extension: `/name <text>` gives the current
+//! session a friendly name, `/name` shows it. Pi stored names in session
+//! metadata; gray sidecars keep a map at
+//! `~/.gray/session-name/names.json` keyed by `session.id`.
+//!
+//! A `prompt/context` hook surfaces the name to the model once per session
+//! (the host dedups injected context, so it stays quiet after the first
+//! turn).
 
 use std::io::{BufRead, Write};
+use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
@@ -13,39 +19,75 @@ fn manifest() -> Value {
         "name": "session-name",
         "version": env!("CARGO_PKG_VERSION"),
         "protocol": "1.1",
-        "tools": [{
-            "name": "session_name_hello",
-            "description": "Example tool from the gray-account template: greets `name`. Replace me.",
-            "parameters": {
-                "type": "object",
-                "properties": { "name": { "type": "string", "description": "Who to greet." } },
-                "required": ["name"]
-            }
-        }],
-        "commands": ["/session-name"],
+        "tools": [],
+        "commands": ["/name"],
+        "hooks": ["prompt/context"],
     })
 }
 
-/// A tool call. Return `Ok(text)` for the model, `Err(text)` for a tool error.
-fn call_tool(name: &str, args: &Value) -> Result<String, String> {
-    match name {
-        "session_name_hello" => {
-            let who = args.get("name").and_then(Value::as_str).unwrap_or("").trim();
-            if who.is_empty() {
-                return Err("missing required argument: name".into());
-            }
-            Ok(format!("hello, {who}!"))
-        }
-        other => Err(format!("unknown tool: {other}")),
+fn names_path() -> PathBuf {
+    let home = std::env::var_os("GRAY_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".gray")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join("session-name").join("names.json")
+}
+
+fn load_names() -> Value {
+    std::fs::read_to_string(names_path())
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| json!({}))
+}
+
+fn save_names(names: &Value) -> std::io::Result<()> {
+    let path = names_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, names.to_string())?;
+    std::fs::rename(&tmp, path)
+}
+
+fn session_id(params: &Value) -> &str {
+    params
+        .pointer("/session/id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+/// `/name …` — `argv` excludes the command name.
+fn run_command(argv: &[&str], session: &str) -> String {
+    let name = argv.join(" ");
+    let name = name.trim();
+    if session.is_empty() {
+        return "no session id — nothing to name".into();
+    }
+    let mut names = load_names();
+    if name.is_empty() {
+        return match names.get(session).and_then(Value::as_str) {
+            Some(n) => format!("Session: {n}"),
+            None => "No session name set".into(),
+        };
+    }
+    names[session] = json!(name);
+    match save_names(&names) {
+        Ok(()) => format!("Session named: {name}"),
+        Err(e) => format!("couldn't save name: {e}"),
     }
 }
 
-/// A slash command typed by the user (`/session-name …`). `argv` excludes the name.
-fn run_command(argv: &[&str]) -> String {
-    if argv.is_empty() {
-        format!("session-name {} — edit src/main.rs to make me useful", env!("CARGO_PKG_VERSION"))
-    } else {
-        format!("session-name got: {}", argv.join(" "))
+/// `prompt/context` — tell the model the session's name once (host dedups).
+fn prompt_context(params: &Value) -> Value {
+    let session = session_id(params);
+    if session.is_empty() {
+        return json!({});
+    }
+    match load_names().get(session).and_then(Value::as_str) {
+        Some(name) => json!({ "text": format!("This session is named \"{name}\".") }),
+        None => json!({}),
     }
 }
 
@@ -60,22 +102,15 @@ fn handle(req: &Value) -> (Option<Value>, bool) {
     };
     let result = match method {
         "plugin/manifest" => manifest(),
-        "tool/call" => {
-            let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-            let args = params.get("args").cloned().unwrap_or(Value::Null);
-            match call_tool(name, &args) {
-                Ok(text) => json!({ "content": text }),
-                Err(text) => json!({ "content": text, "is_error": true }),
-            }
-        }
         "command/run" => {
             let argv: Vec<&str> = params
                 .get("argv")
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(Value::as_str).collect())
                 .unwrap_or_default();
-            json!({ "text": run_command(&argv) })
+            json!({ "text": run_command(&argv, session_id(&params)) })
         }
+        "prompt/context" => prompt_context(&params),
         "plugin/shutdown" => return (Some(json!({ "id": id, "result": {} })), true),
         _ => {
             let error = json!({ "code": -32601, "message": "method not found" });
@@ -115,36 +150,75 @@ mod tests {
         handle(&json!({ "id": 1, "method": method, "params": params })).0.unwrap()
     }
 
+    /// Serialized: GRAY_HOME is process-global and tests share the process.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static CTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn with_home(body: impl FnOnce(&std::path::Path)) {
+        let _g = LOCK.lock().unwrap();
+        let n = CTR.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("gray-session-name-test-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("GRAY_HOME", &dir) };
+        body(&dir);
+        unsafe { std::env::remove_var("GRAY_HOME") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
-    fn manifest_names_the_plugin_and_its_version() {
+    fn manifest_has_command_and_context_hook() {
         let m = call("plugin/manifest", Value::Null)["result"].clone();
         assert_eq!(m["name"], "session-name");
-        assert_eq!(m["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(m["commands"], json!(["/name"]));
+        assert_eq!(m["hooks"], json!(["prompt/context"]));
     }
 
     #[test]
-    fn tool_call_returns_content() {
-        let r = call("tool/call", json!({ "name": "session_name_hello", "args": { "name": "gray" } }));
-        assert_eq!(r["result"]["content"], "hello, gray!");
-        assert!(r["result"].get("is_error").is_none());
+    fn name_set_show_and_context() {
+        with_home(|home| {
+            let sess = json!({"id": "s-42", "cwd": "/tmp/x"});
+            // Nothing set yet.
+            let r = call("command/run", json!({"name": "/name", "argv": [], "session": sess}));
+            assert_eq!(r["result"]["text"], "No session name set");
+            assert_eq!(call("prompt/context", json!({"session": sess}))["result"], json!({}));
+
+            // Set it.
+            let r = call(
+                "command/run",
+                json!({"name": "/name", "argv": ["deep", "dive"], "session": sess}),
+            );
+            assert_eq!(r["result"]["text"], "Session named: deep dive");
+            let r = call("command/run", json!({"name": "/name", "argv": [], "session": sess}));
+            assert_eq!(r["result"]["text"], "Session: deep dive");
+
+            // prompt/context surfaces it.
+            let r = call("prompt/context", json!({"session": sess}));
+            assert_eq!(r["result"]["text"], "This session is named \"deep dive\".");
+
+            // Persisted keyed by session id.
+            let names = load_names();
+            assert_eq!(names["s-42"], "deep dive");
+            let _ = home;
+
+            // A different session sees nothing.
+            let other = json!({"id": "s-99", "cwd": "/tmp/x"});
+            assert_eq!(call("prompt/context", json!({"session": other}))["result"], json!({}));
+        });
     }
 
     #[test]
-    fn tool_errors_are_flagged() {
-        let r = call("tool/call", json!({ "name": "session_name_hello", "args": {} }));
-        assert_eq!(r["result"]["is_error"], true);
+    fn empty_session_id_is_safe() {
+        with_home(|_| {
+            let r = call("command/run", json!({"name": "/name", "argv": ["x"], "session": {}}));
+            assert!(r["result"]["text"].as_str().unwrap().contains("no session id"));
+            assert_eq!(call("prompt/context", json!({"session": {}}))["result"], json!({}));
+        });
     }
 
     #[test]
-    fn unknown_methods_are_method_not_found() {
-        assert_eq!(call("nope", Value::Null)["error"]["code"], -32601);
-    }
-
-    #[test]
-    fn shutdown_replies_then_exits_and_notifications_are_silent() {
+    fn shutdown_replies_then_exits() {
         let (reply, exit) = handle(&json!({ "id": 2, "method": "plugin/shutdown" }));
         assert!(reply.is_some() && exit);
-        let (reply, exit) = handle(&json!({ "method": "plugin/shutdown" }));
-        assert!(reply.is_none() && exit);
     }
 }

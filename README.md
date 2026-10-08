@@ -1,9 +1,29 @@
 # gray-session-name
 
-Human names for sessions (/name + prompt/context). Port of pi's session-name extension.
+Human names for sessions — `/name` plus a `prompt/context` hook. Port of pi's
+`session-name` extension.
 
-A sidecar plugin for [gray](https://github.com/vstaln/gray), scaffolded by
-[gray-account](https://github.com/vstaln/gray-account).
+## Commands
+
+- `/name <text>` — give the current session a friendly name
+- `/name` — show the current name (or that none is set)
+
+## Hooks
+
+`prompt/context` returns `{text: "This session is named \"X\"."}` when the
+session has a name. The host dedups injected context, so it surfaces once and
+stays quiet after the first turn.
+
+## State
+
+`~/.gray/session-name/names.json` (honors `$GRAY_HOME`) — a
+`{session_id: name}` map. Pi stored names in session metadata; the sidecar
+keeps them keyed by `session.id` instead.
+
+## Wire methods
+
+`plugin/manifest`, `command/run`, `prompt/context`, `plugin/shutdown`.
+Protocol 1.1. No tools, no capabilities, no host→sidecar requests.
 
 ## Install
 
@@ -18,6 +38,3 @@ cargo test
 gray account check      # entry point + manifest handshake
 gray account publish    # check → build → release → publish to the gray registry
 ```
-
-Bump `version` in `Cargo.toml` before each `publish`; the registry refuses to
-republish a version.
