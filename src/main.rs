@@ -29,7 +29,7 @@ fn manifest() -> Value {
         "version": env!("CARGO_PKG_VERSION"),
         "protocol": "1.1",
         "tools": [],
-        "description": "give",
+        "description": "give sessions friendly names",
         "commands": ["/name"],
         "hooks": ["prompt/context"],
         "capabilities": ["host.ask"],
