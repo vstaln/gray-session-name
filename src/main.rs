@@ -31,6 +31,7 @@ fn manifest() -> Value {
         "tools": [],
         "description": "give sessions friendly names",
         "commands": ["/name"],
+        "command_descriptions": {"/name": "name or rename this session"},
         "hooks": ["prompt/context"],
         "capabilities": ["host.ask"],
     })
